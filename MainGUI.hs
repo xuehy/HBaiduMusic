@@ -72,7 +72,7 @@ initializeENV :: IO ENV
 initializeENV = do
 	lg <- newIORef False
 	pass <- newIORef []
-	st <- newIORef True
+	st <- newIORef False
 	tt <- newIORef 0.0
 	ct <- newIORef 0.0
 	se <- newIORef 0.0
@@ -84,8 +84,15 @@ initializeENV = do
 	csong <- newIORef 0
 	return $ ENV lg pass st tt ct se tp total page curPage song csong
 
+-- clear the result of last search
+clearResult gui = do
+	zipWithM_ labelSetText (titleshow gui) (map (const "") [1..10])
+	zipWithM_ labelSetText (authorshow gui) (map (const "") [1..10])
+	zipWithM_ labelSetText (albumshow gui) (map (const "") [1..10])
+
 searchAndShow :: GUI -> IORef ENV -> Int -> String -> IO ()
 searchAndShow gui env page keywords = do
+	clearResult gui
 	s <- runMaybeT $ searchMusic page keywords
 	case s of 
 		Nothing -> return ()
@@ -145,6 +152,8 @@ main gladepath = do
 	gui <- loadGlade gladepath
 	_ <- connectGui gui env
 	widgetShowAll $ mainWin gui
+	z <- forkIO $ void $ updateProgress gui env
+	z' <- forkIO $ void $ updateTime gui env
 	mainGUI
 
 loadGlade :: FilePath -> IO GUI
@@ -196,17 +205,22 @@ clickPlay gui env songID = do
 			(_,Just hout,_,_) <- createProcess (proc "mplayer" ["-slave","-quiet","-input","file=/tmp/music","/tmp/tempmusic.mp3"]) 
 												{std_out = CreatePipe}
 			threadDelay 100000
-			print "OK"
+			modifyIORef (status environment) (const True) 
 			environment <- readIORef env 
 			system "echo \"get_time_length\" > /tmp/music" 
 			y <- forM [1..17] (\x -> hGetLine hout)
 			x <- hGetLine hout
 		 	modifyIORef (totalTime environment) (const . read $ drop 11 x)
 			total <- readIORef $ totalTime environment
+
+			-- reset progress and time label
+			modifyIORef (curTime environment) (const 0)
+			modifyIORef (timePos environment) (const 0)
+
 			modifyIORef (step environment) (const (1.0/total))
 			time <- newIORef 0.0
-			z <- forkIO $ void $ updateProgress gui env
-			z' <- forkIO $ void $ updateTime gui env
+			--z <- forkIO $ void $ updateProgress gui env
+			--z' <- forkIO $ void $ updateTime gui env
 			labelSetText (titlePlay gui) (correctShow . 
 							(\x -> subRegex (mkRegex "<em>") x "") . 
 							(\x -> subRegex (mkRegex "</em>") x "") . title $ list !! songID  )
@@ -278,12 +292,16 @@ updateTime gui env = do
 	tp <- readIORef $ timePos environment
 	let curTimeShow = showTimeI tp
 	let totalShow = showTime total
-	if s then 
-		labelSetText (time gui) (curTimeShow ++ "/" ++ totalShow) >> 
-		threadDelay 1000000 >>
-		modifyIORef (timePos environment) (+1) >>
-		updateTime gui env
-	else threadDelay 1000000 >> updateTime gui env
+	if fromIntegral tp >= total && tp /= 0
+		then labelSetText (time gui) (showTimeI 0 ++ "/" ++ showTime 0) >> 
+			 modifyIORef (status environment) (const False)
+		else 
+			if s then 
+				labelSetText (time gui) (curTimeShow ++ "/" ++ totalShow) >> 
+				threadDelay 1000000 >>
+				modifyIORef (timePos environment) (+1) >>
+				updateTime gui env
+			else threadDelay 1000000 >> updateTime gui env
 
 showTimeI :: Int -> String 
 showTimeI y = show minutes ++ ":" ++ show seconds
