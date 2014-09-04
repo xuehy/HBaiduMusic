@@ -141,7 +141,7 @@ main gladepath = do
 	mainGUI
 	
 	waitForLogIn env
-
+	widgetHideAll $ win login
 	gui <- loadGlade gladepath
 	_ <- connectGui gui env
 	widgetShowAll $ mainWin gui
