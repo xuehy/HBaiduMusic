@@ -3,6 +3,7 @@ import Data.IORef
 import Graphics.UI.Gtk.Builder
 import Graphics.UI.Gtk
 import Control.Concurrent 
+import Control.Concurrent.MVar
 import Control.Monad
 import qualified Data.ByteString.Lazy as B
 import Network.HTTP.Conduit
@@ -56,7 +57,7 @@ loadLogin gladepath = do
 data ENV = ENV {
 	login :: IORef Bool,
 	passport :: IORef [String],
-	status :: IORef Bool,       -- playing or pause 
+	status :: IORef Bool,       -- whether the player is interrupted(False)
 	totalTime :: IORef Double,  -- current song's total length (in seconds)
 	curTime :: IORef Double,    -- current time position : range [0,1]
 	step :: IORef Double,       -- progress bar increase step
@@ -65,14 +66,18 @@ data ENV = ENV {
 	pages :: IORef Int,         -- total pages of the result
 	currentPage :: IORef Int,   -- current page
 	songList :: IORef [Music],  -- song list of current page
-	currentSong :: IORef Int    -- id of current song playing in the list
+	currentSong :: IORef Int,   -- id of current song playing in the list
+	mpid :: IORef ProcessHandle,
+	existPid :: IORef Bool,
+	lock :: MVar (),
+	pause :: IORef Bool         -- pause or not
 }
 
 initializeENV :: IO ENV
 initializeENV = do
 	lg <- newIORef False
 	pass <- newIORef []
-	st <- newIORef True
+	st <- newIORef False
 	tt <- newIORef 0.0
 	ct <- newIORef 0.0
 	se <- newIORef 0.0
@@ -82,10 +87,22 @@ initializeENV = do
 	curPage <- newIORef 0
 	song <- newIORef []
 	csong <- newIORef 0
-	return $ ENV lg pass st tt ct se tp total page curPage song csong
+	handle <- runCommand "time"
+	pid <- newIORef handle
+	existpid <- newIORef False
+	lock <- newEmptyMVar
+	pause <- newIORef True
+	return $ ENV lg pass st tt ct se tp total page curPage song csong pid existpid lock pause
+
+-- clear the result of last search
+clearResult gui = do
+	zipWithM_ labelSetText (titleshow gui) (map (const "") [1..10])
+	zipWithM_ labelSetText (authorshow gui) (map (const "") [1..10])
+	zipWithM_ labelSetText (albumshow gui) (map (const "") [1..10])
 
 searchAndShow :: GUI -> IORef ENV -> Int -> String -> IO ()
 searchAndShow gui env page keywords = do
+	clearResult gui
 	s <- runMaybeT $ searchMusic page keywords
 	case s of 
 		Nothing -> return ()
@@ -111,8 +128,10 @@ searchAndShow gui env page keywords = do
 
 
 loginFunc loginWin env = do
-	name <- entryGetText (username loginWin)
-	pass <- entryGetText (passwd loginWin)
+	let name = "xuehoya"
+	let pass = "1015119lqsxhy"
+	--name <- entryGetText (username loginWin)
+	--pass <- entryGetText (passwd loginWin)
 	eitherSession <- runErrorT $ getCookie name pass
 	case eitherSession of
 		Left Unreachable -> labelSetText (info loginWin) "Network unreachable"
@@ -125,6 +144,8 @@ loginFunc loginWin env = do
 			mainQuit
 
 waitForLogIn env = do
+	_ <- timeoutAddFull (yield >> return True)
+			priorityDefaultIdle 100
 	environment	<- readIORef env 
 	lg <- readIORef (login environment)
 	unless lg $ waitForLogIn env
@@ -135,17 +156,20 @@ main gladepath = do
 	_ <- timeoutAddFull (yield >> return True)
 				   priorityDefaultIdle 50	
 	env <- initializeENV >>= newIORef 
+	environment <- readIORef env
+	putMVar (lock environment) ()
 	login <- loadLogin gladepath
 	button login `on` buttonActivated $ liftIO $ loginFunc login env
+	gui <- loadGlade gladepath
+	_ <- connectGui gui env
 	widgetShowAll $ win login
 	mainGUI
 	
 	waitForLogIn env
-
-	gui <- loadGlade gladepath
-	_ <- connectGui gui env
+	widgetHideAll $ win login
 	widgetShowAll $ mainWin gui
 	mainGUI
+
 
 loadGlade :: FilePath -> IO GUI
 loadGlade gladepath = do
@@ -182,35 +206,75 @@ clickPlay gui env songID = do
 	list <- readIORef $ songList environment
 	unless (songID >= length list) $ do
 		url <- makeDownloadURL session $ songId (list !! songID)
+		unless (null url) $ do
+			content <- simpleHttp $ "http://music.baidu.com" ++ url
+			unless (B.null content) $ do
 
-		content <- simpleHttp $ "http://music.baidu.com" ++ url
-		unless (B.null content) $ do
-			forkIO (void (system "echo \"quit\" > /tmp/music\n")) >> threadDelay 1000000
-			B.writeFile "/tmp/tempmusic.mp3" content
-			doesFileExist "/tmp/music" >>= 
-				\x -> when x $ void (system "unlink /tmp/music") 
-			system "mkfifo /tmp/music"
+				forkIO (void (system "echo \"quit\" > /tmp/music\n")) >> threadDelay 1000000
+				existpid <- readIORef (existPid environment)
+				prevPid <- readIORef (mpid environment)
+				exitcode <- getProcessExitCode prevPid
+				case exitcode of
+					Just _ -> return ()
+					Nothing -> when existpid $ terminateProcess prevPid
+				B.writeFile "/tmp/tempmusic.mp3" content
+				doesFileExist "/tmp/music" >>= 
+					\x -> when x $ void (system "unlink /tmp/music") 
 
-			threadDelay 2000000
+				(_,_,_,pid) <- createProcess (proc "mkfifo" ["/tmp/music"])
+				_ <- waitForProcess pid
 
-			(_,Just hout,_,_) <- createProcess (proc "mplayer" ["-slave","-quiet","-input","file=/tmp/music","/tmp/tempmusic.mp3"]) 
-												{std_out = CreatePipe}
-			threadDelay 100000
-			print "OK"
-			environment <- readIORef env 
-			system "echo \"get_time_length\" > /tmp/music" 
-			y <- forM [1..17] (\x -> hGetLine hout)
-			x <- hGetLine hout
-		 	modifyIORef (totalTime environment) (const . read $ drop 11 x)
-			total <- readIORef $ totalTime environment
-			modifyIORef (step environment) (const (1.0/total))
-			time <- newIORef 0.0
-			z <- forkIO $ void $ updateProgress gui env
-			z' <- forkIO $ void $ updateTime gui env
-			labelSetText (titlePlay gui) (correctShow . 
-							(\x -> subRegex (mkRegex "<em>") x "") . 
-							(\x -> subRegex (mkRegex "</em>") x "") . title $ list !! songID  )
-			return ()
+				-- wait for progressBar and Timelabel threads to stop
+				modifyIORef (status environment) (const False)
+				--takeMVar (lock environment) 
+
+				-- the player is not paused when mplayer is started
+				modifyIORef (pause environment) (const False) 
+
+				pout <- newEmptyMVar
+				phandle <- newEmptyMVar
+		
+				forkIO $ do
+					(_,Just pipe,_,ph) <- createProcess (proc "mplayer" ["-slave","-quiet","-input","file=/tmp/music","/tmp/tempmusic.mp3"]) 
+														{std_out = CreatePipe}
+					let readLine pipeOut line = 
+						if line == 17 then return line 
+							else do 
+								flag <- hIsEOF pipeOut 
+								if flag then readLine pipeOut line 
+								else do 
+								 	y <- hGetLine pipeOut
+								 	readLine pipeOut (line+1)
+
+					_ <- readLine pipe 0
+					putMVar pout pipe 
+					putMVar phandle ph 
+
+				hout <- takeMVar pout 
+				handle <- takeMVar phandle
+				modifyIORef (mpid environment) (const handle)
+				modifyIORef (existPid environment) (const True)
+				-- reset progress and time label
+				modifyIORef (curTime environment) (const 0)
+				modifyIORef (timePos environment) (const 0)
+				
+				modifyIORef (status environment) (const True) 
+				environment <- readIORef env 
+				system "echo \"get_time_length\" > /tmp/music" 
+		
+				x <- hGetLine hout
+				modifyIORef (totalTime environment) (const . read $ drop 11 x)
+				total <- readIORef $ totalTime environment
+
+				modifyIORef (step environment) (const (1.0/total))
+				time <- newIORef 0.0
+				
+				--z <- forkIO $ void $ updateProgress gui env
+				--z' <- forkIO $ void $ updateTime gui env
+				labelSetText (titlePlay gui) (correctShow . 
+								(\x -> subRegex (mkRegex "<em>") x "") . 
+								(\x -> subRegex (mkRegex "</em>") x "") . title $ list !! songID  )
+				return ()
 
 -- when the search button is clicked
 clickSearch :: GUI -> IORef ENV -> IO ()
@@ -218,7 +282,7 @@ clickSearch gui env = do
 	keywords <- entryGetText (inputEntry gui)
 	_ <- timeoutAddFull (yield >> return True)
 				   priorityDefaultIdle 100
-	unless (null keywords) $ searchAndShow gui env 1 keywords
+	void $ forkIO $ unless (null keywords) $ searchAndShow gui env 1 keywords
 
 prevPage :: GUI -> IORef ENV -> IO ()
 prevPage gui env = do
@@ -262,13 +326,16 @@ updateProgress gui env = do
 	environment <- readIORef env 
 	s <- readIORef $ status environment
 	step <- readIORef $ step environment
+	pauseFlag <- readIORef $ pause environment
+	when pauseFlag $ updateProgress gui env >> threadDelay 100000
 	if s then 
 		readIORef (curTime environment) >>= 
 	    \t -> when (t < 1.0) $ progressBarSetFraction (pg gui) t >>
 		threadDelay 1000000 >>
 		modifyIORef (curTime environment) (+step) >>
 		updateProgress gui env
-	else threadDelay 1000000 >> updateProgress gui env
+	else updateProgress gui env >> threadDelay 100000
+	--else putMVar (lock environment) ()
 
 -- update the time label
 updateTime gui env = do
@@ -278,12 +345,18 @@ updateTime gui env = do
 	tp <- readIORef $ timePos environment
 	let curTimeShow = showTimeI tp
 	let totalShow = showTime total
-	if s then 
-		labelSetText (time gui) (curTimeShow ++ "/" ++ totalShow) >> 
-		threadDelay 1000000 >>
-		modifyIORef (timePos environment) (+1) >>
-		updateTime gui env
-	else threadDelay 1000000 >> updateTime gui env
+	pauseFlag <- readIORef $ pause environment
+	when pauseFlag $ updateTime gui env >> threadDelay 100000
+	if fromIntegral tp >= total && tp /= 0
+		then labelSetText (time gui) (showTimeI 0 ++ "/" ++ showTime 0) >> 
+			 modifyIORef (status environment) (const False)
+		else 
+			if s then
+				labelSetText (time gui) (curTimeShow ++ "/" ++ totalShow) >> 
+				threadDelay 1000000 >>
+				modifyIORef (timePos environment) (+1) >>
+				updateTime gui env
+			else updateTime gui env >> threadDelay 100000
 
 showTimeI :: Int -> String 
 showTimeI y = show minutes ++ ":" ++ show seconds
@@ -301,7 +374,7 @@ showTime t = show minutes ++ ":" ++ show seconds
 guiPlay :: GUI -> IORef ENV -> IO ()
 guiPlay gui env = do
 	environment <- readIORef env
-	modifyIORef (status environment) not 
+	modifyIORef (pause environment) not 
 	system "echo \"pause\" > /tmp/music"
 	return ()
 

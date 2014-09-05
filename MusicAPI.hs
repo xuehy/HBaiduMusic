@@ -121,16 +121,6 @@ makeDownloadURL session songID = do
       let html = parseHTML doc
       liftM head $ runX (html >>> fetchDownloadURL) 
 
-
---main = do
---  (getCookie >>= (\x -> liftIO $ makeDownloadURL x $ show 10525914) 
---  print s
---  r <- runErrorT getCookie
---  let Right a = r
---  print a
-
-
-
 -- simulate baidu login
 
 data LoginError = Unreachable | LoginWrong | OtherError String
@@ -149,11 +139,10 @@ getCookie name pass = do
       -- get token
       let apiurl = "http://passport.baidu.com/v2/api/?getapi&class=login&tpl=mn&tangram=true"
       let Just uri = parseURI apiurl
-      resp <- liftIO $ simpleHTTP $ Request uri GET [mkHeader HdrCookie cookie] ""
+      resp <- liftIO $ simpleHTTP $ Request uri GET [mkHeader HdrCookie cookie,mkHeader HdrUserAgent "Mozilla/5.0 (X11; Linux x86_64; rv:31.0) Gecko/20100101 Firefox/31.0"] ""
       doc <- liftIO $ getResponseBody resp
       let pattern = "bdPass.api.params.login_token='(.)*'"
       let token = take 32 $ drop 31 $ doc =~ pattern :: String
-   
       -- log in
       let baiduMainLoginUrl = "http://passport.baidu.com/v2/api/?login"
       let staticPage = "http://www.baidu.com/cache/user/html/jump.html"
@@ -166,6 +155,7 @@ getCookie name pass = do
                     ++ urlEncode "1" ++ "&tpl="
                     ++ urlEncode "mn" ++ "&callback="
                     ++ urlEncode "parent.bdPass.api.login._postCallback"
+                    ++ "&verifycode=" 
                     ++ "&username=" ++ urlEncode name
                     ++ "&password=" ++ urlEncode pass
                     ++ "&mem_pass=" ++ urlEncode "on"
@@ -183,6 +173,7 @@ getCookie name pass = do
                         concatMap (=~ "BDUSS=(.)*; ") cookies :: String
           let bduid = take 32 $ drop 8 $ 
                         cookie =~ "BAIDUID=([0-9]|[A-Z]|[a-z])*" :: String
+     
           if null cookies || null bduss || null bduid
             then throwError LoginWrong
             else return [bduss,bduid]
