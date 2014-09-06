@@ -127,10 +127,8 @@ searchAndShow gui env page keywords = do
 
 
 loginFunc loginWin env = do
-	let name = "xuehoya"
-	let pass = "1015119lqsxhy"
-	--name <- entryGetText (username loginWin)
-	--pass <- entryGetText (passwd loginWin)
+	name <- entryGetText (username loginWin)
+	pass <- entryGetText (passwd loginWin)
 	eitherSession <- runErrorT $ getCookie name pass
 	case eitherSession of
 		Left Unreachable -> labelSetText (info loginWin) "Network unreachable"
