@@ -16,6 +16,7 @@ import MusicAPI
 import Control.Monad.Trans
 import Control.Monad.Trans.Maybe
 import Text.Regex
+import Text.Regex.Posix
 import Control.Monad.Error
 data GUI = GUI {
 	mainWin :: Window,
@@ -68,7 +69,6 @@ data ENV = ENV {
 	songList :: IORef [Music],  -- song list of current page
 	currentSong :: IORef Int,   -- id of current song playing in the list
 	mpid :: IORef ProcessHandle,
-	existPid :: IORef Bool,
 	lock :: MVar (),
 	pause :: IORef Bool         -- pause or not
 }
@@ -89,10 +89,9 @@ initializeENV = do
 	csong <- newIORef 0
 	handle <- runCommand "time"
 	pid <- newIORef handle
-	existpid <- newIORef False
 	lock <- newEmptyMVar
 	pause <- newIORef True
-	return $ ENV lg pass st tt ct se tp total page curPage song csong pid existpid lock pause
+	return $ ENV lg pass st tt ct se tp total page curPage song csong pid lock pause
 
 -- clear the result of last search
 clearResult gui = do
@@ -197,7 +196,7 @@ loadGlade gladepath = do
 		           "button" ++ show x)
 	               [4..13]
 	title <- builderGetObject builder castToLabel "label2"
-	return $ GUI mw mplay mpg mtime mtitle mauthor malbum mentry msearch mpage prev next play title
+	return $ GUI mw mplay mpg mtime mtitle mauthor malbum mentry msearch mpage prev next play title 
 
 clickPlay :: GUI -> IORef ENV -> Int -> IO ()
 clickPlay gui env songID = do
@@ -209,14 +208,14 @@ clickPlay gui env songID = do
 		unless (null url) $ do
 			content <- simpleHttp $ "http://music.baidu.com" ++ url
 			unless (B.null content) $ do
-
-				forkIO (void (system "echo \"quit\" > /tmp/music\n")) >> threadDelay 1000000
-				existpid <- readIORef (existPid environment)
+				forkIO $ void (system "echo \"quit\" > /tmp/music\n") 
+				threadDelay 1000000
 				prevPid <- readIORef (mpid environment)
 				exitcode <- getProcessExitCode prevPid
+				-- whether the previous mplayer process is still on
 				case exitcode of
 					Just _ -> return ()
-					Nothing -> when existpid $ terminateProcess prevPid
+					Nothing -> terminateProcess prevPid
 				B.writeFile "/tmp/tempmusic.mp3" content
 				doesFileExist "/tmp/music" >>= 
 					\x -> when x $ void (system "unlink /tmp/music") 
@@ -226,8 +225,8 @@ clickPlay gui env songID = do
 
 				-- wait for progressBar and Timelabel threads to stop
 				modifyIORef (status environment) (const False)
-				--takeMVar (lock environment) 
-
+				takeMVar (lock environment) 
+		
 				-- the player is not paused when mplayer is started
 				modifyIORef (pause environment) (const False) 
 
@@ -237,23 +236,23 @@ clickPlay gui env songID = do
 				forkIO $ do
 					(_,Just pipe,_,ph) <- createProcess (proc "mplayer" ["-slave","-quiet","-input","file=/tmp/music","/tmp/tempmusic.mp3"]) 
 														{std_out = CreatePipe}
-					let readLine pipeOut line = 
-						if line == 17 then return line 
+					hSetEncoding pipe char8
+					let readLine pipeOut = do
+						flag <- hIsEOF pipeOut 
+						if flag then readLine pipeOut
 							else do 
-								flag <- hIsEOF pipeOut 
-								if flag then readLine pipeOut line 
-								else do 
-								 	y <- hGetLine pipeOut
-								 	readLine pipeOut (line+1)
+								 y <- hGetLine pipeOut
+								 let isEnd = y =~ "Starting playback..." :: Bool
+								 unless isEnd $ readLine pipeOut 
 
-					_ <- readLine pipe 0
+					_ <- readLine pipe 
 					putMVar pout pipe 
 					putMVar phandle ph 
 
 				hout <- takeMVar pout 
 				handle <- takeMVar phandle
 				modifyIORef (mpid environment) (const handle)
-				modifyIORef (existPid environment) (const True)
+		
 				-- reset progress and time label
 				modifyIORef (curTime environment) (const 0)
 				modifyIORef (timePos environment) (const 0)
@@ -269,8 +268,8 @@ clickPlay gui env songID = do
 				modifyIORef (step environment) (const (1.0/total))
 				time <- newIORef 0.0
 				
-				--z <- forkIO $ void $ updateProgress gui env
-				--z' <- forkIO $ void $ updateTime gui env
+				z <- forkIO $ void $ updateProgress gui env
+				z' <- forkIO $ void $ updateTime gui env
 				labelSetText (titlePlay gui) (correctShow . 
 								(\x -> subRegex (mkRegex "<em>") x "") . 
 								(\x -> subRegex (mkRegex "</em>") x "") . title $ list !! songID  )
@@ -282,18 +281,19 @@ clickSearch gui env = do
 	keywords <- entryGetText (inputEntry gui)
 	_ <- timeoutAddFull (yield >> return True)
 				   priorityDefaultIdle 100
-	void $ forkIO $ unless (null keywords) $ searchAndShow gui env 1 keywords
-
+	void $ forkIO $ unless (null keywords) $ searchAndShow gui env 1 keywords 
+		
 prevPage :: GUI -> IORef ENV -> IO ()
 prevPage gui env = do
 	environment <- readIORef env
 	curPage <- readIORef (currentPage environment)
 	_ <- timeoutAddFull (yield >> return True)
 				   priorityDefaultIdle 100
+	
 	unless (curPage == 1) $ do
     	 keywords <- entryGetText (inputEntry gui)
     	 modifyIORef (currentPage environment) (\x->x-1)
-    	 unless (null keywords) $ searchAndShow gui env (curPage-1) keywords
+    	 void $ forkIO $ unless (null keywords) $ searchAndShow gui env (curPage-1) keywords 
 
 nextPage :: GUI -> IORef ENV -> IO ()
 nextPage gui env = do 
@@ -305,7 +305,7 @@ nextPage gui env = do
 	when (curPage < totalPage) $ do
     	 keywords <- entryGetText (inputEntry gui)
     	 modifyIORef (currentPage environment) (+1)
-    	 unless (null keywords) $ searchAndShow gui env (curPage+1) keywords
+    	 void $ forkIO $ unless (null keywords) $ searchAndShow gui env (curPage+1) keywords 
 
 
 connectGui gui env = do
@@ -322,22 +322,33 @@ connectGui gui env = do
 
 
 -- update the progress bar 
+-- make sure it is tail-recursive
 updateProgress gui env = do
 	environment <- readIORef env 
 	s <- readIORef $ status environment
 	step <- readIORef $ step environment
 	pauseFlag <- readIORef $ pause environment
-	when pauseFlag $ updateProgress gui env >> threadDelay 100000
-	if s then 
-		readIORef (curTime environment) >>= 
-	    \t -> when (t < 1.0) $ progressBarSetFraction (pg gui) t >>
-		threadDelay 1000000 >>
-		modifyIORef (curTime environment) (+step) >>
-		updateProgress gui env
-	else updateProgress gui env >> threadDelay 100000
-	--else putMVar (lock environment) ()
+	-- still playing
+	if s 
+		then 
+			-- if paused
+			if pauseFlag 
+				then threadDelay 100000 >> updateProgress gui env 
+				-- tell new player thread it can create new progress and timeLabel threads
+				else 
+					readIORef (curTime environment) >>= 
+				    \t -> when (t < 1.0) $ progressBarSetFraction (pg gui) t >>
+					threadDelay 1000000 >>
+					modifyIORef (curTime environment) (+step) >>
+					updateProgress gui env
+		-- mplayer is interrupted or stopped naturally
+		else putMVar (lock environment) () 
+		
+	
+				
 
 -- update the time label
+-- make sure it is tail-recursive
 updateTime gui env = do
 	environment <- readIORef env 
 	s <- readIORef $ status environment
@@ -346,17 +357,24 @@ updateTime gui env = do
 	let curTimeShow = showTimeI tp
 	let totalShow = showTime total
 	pauseFlag <- readIORef $ pause environment
-	when pauseFlag $ updateTime gui env >> threadDelay 100000
-	if fromIntegral tp >= total && tp /= 0
-		then labelSetText (time gui) (showTimeI 0 ++ "/" ++ showTime 0) >> 
-			 modifyIORef (status environment) (const False)
-		else 
-			if s then
-				labelSetText (time gui) (curTimeShow ++ "/" ++ totalShow) >> 
-				threadDelay 1000000 >>
-				modifyIORef (timePos environment) (+1) >>
-				updateTime gui env
-			else updateTime gui env >> threadDelay 100000
+	
+	if pauseFlag 
+		then threadDelay 100000 >> updateTime gui env 
+		else when s $
+				-- if the song ends naturally (because time overs)
+				if fromIntegral tp >= total && tp /= 0
+					then labelSetText (time gui) (showTimeI 0 ++ "/" ++ showTime 0) >> 
+			     		 -- modify status to false to indicate that mplayer is stopped
+				 		 modifyIORef (status environment) (const False)
+		 				 -- this thread for timeLabel thus terminates itself
+		 			else
+						labelSetText (time gui) (curTimeShow ++ "/" ++ totalShow) >> 
+						threadDelay 1000000 >>
+						modifyIORef (timePos environment) (+1) >>
+						updateTime gui env
+
+			
+
 
 showTimeI :: Int -> String 
 showTimeI y = show minutes ++ ":" ++ show seconds
